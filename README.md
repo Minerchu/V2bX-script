@@ -24,6 +24,9 @@ wget -N https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh
 安装流程和原版完全一样（选核心、填面板地址、API Key、节点 ID、证书模式），
 **最后会多一步**：等证书签发完成后，自动生成一个随机企业站并接管 443。
 
+> **端口和路径都不用填。** 这两项由 V2bX 自己从面板拉取，安装脚本只是把拉到的值打印出来给你核对。
+> 你唯一需要提供的是面板对接信息（ApiHost / ApiKey / NodeID），那是 V2bX 自己运行也需要的。
+
 安装结束后会打印：
 
 ```
@@ -90,6 +93,41 @@ curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/hkbt.sh
 | 部署站点 | 随机模板 + 随机品牌，生成 13 页站点到 `/var/www/hkbt` |
 | 接管 443 | nginx 监听 443，按路径分流到代理端口 |
 
+### 端口和路径从哪来
+
+V2bX 的 `config.json` 里**只有 NodeID 和 API 凭据**，真正的 `server_port` 和 ws `path`
+是它启动时从面板 API 拉的，磁盘上没有副本。所以本站也走同一个来源：
+
+```
+/etc/V2bX/config.json  ──ApiHost/ApiKey/NodeID──▶  面板 API
+                                                     │
+                       ┌─────────────────────────────┘
+                       ▼
+        server_port + networkSettings.path
+                       │
+                       ▼
+        nginx location 与 proxy_pass
+```
+
+安装时会打印实际读到的值：
+
+```
+[HKBT] 从面板读取节点端口与路径（无需手工填写）
+  节点域名   jpcdn.example.com
+  代理端口   20000  ← 面板读取
+  代理路径   /sdf=?kfj  ← 面板读取
+  节点类型   ws / TLS
+```
+
+兼容 V2board 与 Xboard 两套字段（`networkSettings` / `network_settings`，含 `data` 包装层）。
+
+**读不到就不部署。** 如果面板不可达，或节点是 tcp / reality 这类没有 path 的类型，
+脚本会直接中止并列出排查项 —— 因为猜一个默认路径会让 Nginx 分流与节点不一致，
+表现为客户端握手能过、随即断开，比直接报错难查得多。
+
+只有一种情况会用本地记录：面板完全不可达、但本机上次部署成功过。
+此时会明确提示「沿用上次记录的路径」，面板改过 path 的话需要先恢复连通再部署。
+
 ### 端口怎么分配
 
 | 节点端口 | nginx | sing-box | 说明 |
@@ -126,6 +164,16 @@ journalctl -u V2bX -n 50 --no-pager
 
 路径必须与面板节点完全一致。带 `?` 和 `=` 的路径（如 `/sdf=?kfj`）要原样填。
 脚本已在服务端兼容 `/sdf`、`/sdf?kfj`、`/sdf=?kfj` 三种写法。
+
+**在面板里改了节点路径或端口？**
+
+改完要重新生成一次 nginx 配置，否则分流规则还是旧的：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/hkbt.sh | bash
+```
+
+脚本会重新从面板读取端口和路径，不需要手工改任何文件。
 
 **能连上但网页打不开？**
 

@@ -123,22 +123,79 @@ else
     [[ ${#PASS} -lt 12 ]] && PASS="Hkbt@$(date +%s | tail -c 7)"
 fi
 
-# ---------- 6. 部署 ----------
-info "开始部署（随机模板 + 随机品牌）"
+# ---------- 6. 从面板读取节点参数 ----------
+# 端口和路径都由 V2bX 从面板拉取，这里只是提前问一次用于显示和校验，
+# 不写死任何值。面板不通就不部署 —— 猜错路径会让代理静默失联。
+info "从面板读取节点端口与路径（无需手工填写）"
 cd "$HKBT_DIR" || exit 1
-python3 app.py --init --auto --port 443 --password "$PASS"
-rc=$?
 
-if [[ $rc -ne 0 ]]; then
-    err "部署未通过自检，详见 /var/log/hkbt-deploy.log"
-    err "可用面板重新部署：https://<域名>/<admin_path>/"
+probe=$(python3 app.py --probe 2>/dev/null)
+prc=$?
+
+if [[ $prc -eq 2 ]]; then
+    err "面板没有返回节点路径（ws path），已中止部署"
+    echo "$probe" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print('  原因：%s' % (d.get('api_msg') or '节点不是 ws / grpc 类型，没有 path'))
+except Exception:
+    print('  原因：探测无输出')
+" 2>/dev/null
+    err "请检查 /etc/V2bX/config.json 的 ApiHost / ApiKey / NodeID，以及本机能否访问面板"
+    err "修好后重新执行：bash hkbt.sh"
+    exit 1
 fi
+
+echo "$probe" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+src = '面板读取' if d.get('source') == 'panel' else '进程表/历史记录'
+print('  节点域名   %s' % (d.get('domain') or '未取到'))
+print('  代理端口   %s  ← %s' % (d.get('port') or '未取到', src))
+print('  代理路径   %s  ← %s' % (d.get('path') or '未取到', src))
+print('  节点类型   %s%s' % (d.get('network') or '未知', ' / TLS' if d.get('tls') else ''))
+" 2>/dev/null
+
+# ---------- 7. 部署 ----------
+OUT_PORT="${HKBT_OUT_PORT:-443}"
+info "开始部署（对外端口 ${OUT_PORT}，随机模板 + 随机品牌）"
+DEPLOY_ARGS=(--init --auto --port "$OUT_PORT" --password "$PASS")
+# 仅调试用：正常情况下不需要设置 HKBT_PATH
+[[ -n "$HKBT_PATH" ]] && DEPLOY_ARGS+=(--path "$HKBT_PATH")
+python3 app.py "${DEPLOY_ARGS[@]}"
+rc=$?
 
 mkdir -p "$HKBT_DIR"
 printf '%s\n' "$PASS" > "$PASS_FILE"
 chmod 600 "$PASS_FILE"
 
-# ---------- 7. 汇总 ----------
+if [[ $rc -ne 0 ]]; then
+    err "部署未通过自检，详见 /var/log/hkbt-deploy.log"
+    err "面板密码已保存在 $PASS_FILE"
+    exit 1
+fi
+
+# ---------- 8. 证书续期方式检查 ----------
+# CertMode=http 时 V2bX 要自己监听 80 做 HTTP-01，但 Nginx 已占 80，
+# 到期续签必然失败，网站和代理会一起失联。这里只提示，不擅自改配置。
+certmode=$(python3 - "$V2BX_CONF" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print((d.get("Nodes") or [{}])[0].get("CertConfig", {}).get("CertMode", "") or "")
+except Exception:
+    print("")
+PY
+)
+if [[ "$certmode" == "http" ]]; then
+    echo
+    err "注意：证书续期方式是 http（HTTP-01），需要 V2bX 自己监听 80 端口"
+    err "      但 Nginx 已占用 80，${cert_path} 到期前续签会失败，站点和代理会同时失联"
+    err "      建议改成 dns 模式（如 Cloudflare），参考 TROUBLESHOOTING 第 11 条"
+fi
+
+# ---------- 9. 汇总 ----------
 python3 - "$PASS_FILE" <<'PY'
 import json, os, sys
 try:
@@ -160,7 +217,7 @@ print("  部署面板   https://%s%s/" % (d, c.get("admin_path", "")))
 print("  面板密码   %s" % pw)
 print("  网站名称   %s" % c.get("brand", ""))
 print("  站点模板   %s" % c.get("template", ""))
-print("  对外端口   443")
+print("  对外端口   %s" % c.get("port", "443"))
 print("  代理端口   %s" % c.get("proxy_port", ""))
 print("  代理路径   %s" % c.get("path", ""))
 print("-" * 58)
