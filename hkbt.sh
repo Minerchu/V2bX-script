@@ -163,6 +163,8 @@ info "开始部署（对外端口 ${OUT_PORT}，随机模板 + 随机品牌）"
 DEPLOY_ARGS=(--init --auto --port "$OUT_PORT" --password "$PASS")
 # 仅调试用：正常情况下不需要设置 HKBT_PATH
 [[ -n "$HKBT_PATH" ]] && DEPLOY_ARGS+=(--path "$HKBT_PATH")
+# 关闭「代理端口也显示网站」的 NAT 重定向
+[[ "$HKBT_NO_CAMOUFLAGE" == "1" ]] && DEPLOY_ARGS+=(--no-camouflage)
 python3 app.py "${DEPLOY_ARGS[@]}"
 rc=$?
 
@@ -220,6 +222,9 @@ print("  站点模板   %s" % c.get("template", ""))
 print("  对外端口   %s" % c.get("port", "443"))
 print("  代理端口   %s" % c.get("proxy_port", ""))
 print("  代理路径   %s" % c.get("path", ""))
+pp = str(c.get("proxy_port", ""))
+if pp and pp != str(c.get("port", "443")):
+    print("  端口伪装   https://%s:%s/ 同样显示网站" % (d, pp))
 print("-" * 58)
 print("  密码同时保存在 %s" % sys.argv[1])
 print("=" * 58)

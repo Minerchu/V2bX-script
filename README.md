@@ -137,6 +137,24 @@ V2bX 的 `config.json` 里**只有 NodeID 和 API 凭据**，真正的 `server_p
 
 **面板里的端口永远填 443**。填代理端口会被校验拒绝，因为 nginx 绑不上。
 
+### 代理端口也是网站
+
+节点端口是 20000 时，`https://域名:20000/` 默认会返回 sing-box 的空 404 —— 一眼就能看出不是网站。
+部署时会自动加一条 NAT 重定向，把外部到 20000 的连接转到 443：
+
+```
+https://域名/           → 网站
+https://域名:20000/     → 网站（NAT 转到 443，同样由 nginx 处理）
+https://域名/<path>     → 代理
+https://域名:20000/<path> → 代理
+```
+
+规则写成 `hkbt-nat.service`，开机自动加载；改端口后重新部署会先清旧规则。
+不想开的话：`HKBT_NO_CAMOUFLAGE=1 bash hkbt.sh`（或部署后 `systemctl disable --now hkbt-nat`）。
+
+> 副作用：代理看到的客户端 IP 变成 `127.0.0.1`。流量统计按 UUID 算不受影响，
+> 但面板若开了「同 IP 设备数限制」，多设备可能被算成一个。
+
 ### 面板能做什么
 
 `https://域名/__deploy-xxxxxxxx/`，随机路径，不额外开端口：
