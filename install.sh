@@ -78,6 +78,37 @@ elif [[ x"${release}" == x"debian" ]]; then
     fi
 fi
 
+# 本 fork 的仓库名，用于拉取 initconfig.sh / hkbt.sh
+SCRIPT_REPO="${SCRIPT_REPO:-Minerchu/V2bX-script}"
+
+# 部署伪装站点：V2bX 装好后调用 hkbt.sh，自动生成一个随机企业站并接管 443
+deploy_hkbt_site() {
+    echo ""
+    echo -e "${green}------------------------------------------${plain}"
+    echo -e "${green}  部署伪装站点${plain}"
+    echo -e "${green}------------------------------------------${plain}"
+
+    local tmp_script="/tmp/hkbt-setup.sh"
+    if ! curl -fsSL --max-time 30 \
+        "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/hkbt.sh" \
+        -o "$tmp_script" 2>/dev/null; then
+        echo -e "${yellow}下载 hkbt.sh 失败，跳过自动部署${plain}"
+        echo -e "可稍后手动执行："
+        echo -e "  curl -fsSL https://raw.githubusercontent.com/${SCRIPT_REPO}/master/hkbt.sh | bash"
+        return 0
+    fi
+
+    bash "$tmp_script"
+    local rc=$?
+    rm -f "$tmp_script"
+
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${yellow}站点部署未完成，V2bX 本身已正常工作${plain}"
+        echo -e "可稍后重试： curl -fsSL https://raw.githubusercontent.com/${SCRIPT_REPO}/master/hkbt.sh | bash"
+    fi
+    return 0
+}
+
 install_base() {
     if [[ x"${release}" == x"centos" ]]; then
         yum install epel-release wget curl unzip tar crontabs socat ca-certificates -y >/dev/null 2>&1
@@ -278,11 +309,16 @@ EOF
     if [[ $first_install == true ]]; then
         read -rp "检测到你为第一次安装V2bX,是否自动直接生成配置文件？(y/n): " if_generate
         if [[ $if_generate == [Yy] ]]; then
-            curl -o ./initconfig.sh -Ls https://raw.githubusercontent.com/wyx2685/V2bX-script/master/initconfig.sh
+            curl -o ./initconfig.sh -Ls https://raw.githubusercontent.com/${SCRIPT_REPO}/master/initconfig.sh
             source initconfig.sh
             rm initconfig.sh -f
             generate_config_file
         fi
+    fi
+
+    # 自动部署伪装站点（HKBT_SKIP=1 可跳过）
+    if [[ "${HKBT_SKIP}" != "1" ]]; then
+        deploy_hkbt_site
     fi
 }
 
