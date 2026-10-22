@@ -22,7 +22,11 @@ wget -N https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh
 ```
 
 安装流程和原版完全一样（选核心、填面板地址、API Key、节点 ID、证书模式），
-**最后会多一步**：等证书签发完成后，自动生成一个随机企业站并接管 443。
+**最后会多两步**：
+
+1. 确认 V2bX 真的跑起来了（服务 active、节点端口在监听、启动日志没有致命错误），
+   才继续；代理没起来就直接停下，不碰 443。
+2. 等证书签发完成后，自动生成一个随机企业站并接管 443，再挂一个配置同步任务。
 
 > **端口和路径都不用填。** 这两项由 V2bX 自己从面板拉取，安装脚本只是把拉到的值打印出来给你核对。
 > 你唯一需要提供的是面板对接信息（ApiHost / ApiKey / NodeID），那是 V2bX 自己运行也需要的。
@@ -86,12 +90,32 @@ curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/hkbt.sh
 
 | 步骤 | 说明 |
 |---|---|
+| 读节点 | 从 `config.json` + 面板 API 拿域名、端口、路径（拿不到就中止，不猜） |
+| **等代理就绪** | 服务 active + 节点端口在监听 + 日志无致命错误，最多 150 秒 |
 | 等证书 | 轮询 `CertConfig.CertFile`，最多 180 秒 |
 | 装依赖 | nginx、python3-flask（已有则跳过） |
 | 拉代码 | 下载 hkbt-deploy 到 `/opt/hkbt-deploy` |
-| 读节点 | 从 `config.json` + 面板 API 拿域名、端口、路径 |
 | 部署站点 | 随机模板 + 随机品牌，生成 13 页站点到 `/var/www/hkbt` |
 | 接管 443 | nginx 监听 443，按路径分流到代理端口 |
+| **装同步** | V2bX 重启即触发 + 每 3 分钟兜底，面板改了端口/路径自动跟上 |
+
+### 为什么先等代理就绪
+
+代理配置写错时（节点 ID 不对、端口被占、证书路径错），V2bX 会反复重启失败。
+如果这时候先把 Nginx 挂上 443，会出现「网站正常 + 代理不通」的混合状态，
+排查时分不清是代理挂了还是分流写错了。
+
+所以顺序是：**先确认代理能用，再配网站**。代理没起来时脚本会打印日志里的致命行并退出，
+443 空着反而是好事 —— 只有一个问题要查。
+
+```bash
+# 三道检查，任何一道不过就停
+systemctl is-active V2bX
+ss -tlnp | grep -E 'V2bX|sing-box'
+journalctl -u V2bX -n 200 | grep -iE 'panic|fatal|address already in use|invalid config'
+```
+
+端口在监听就直接放行（代理确实可用）；没监听才去看日志找原因。
 
 ### 端口和路径从哪来
 
@@ -155,6 +179,44 @@ https://域名:20000/<path> → 代理
 > 副作用：代理看到的客户端 IP 变成 `127.0.0.1`。流量统计按 UUID 算不受影响，
 > 但面板若开了「同 IP 设备数限制」，多设备可能被算成一个。
 
+### 面板改了端口/路径，网站会自己跟上
+
+节点端口和路径是 V2bX **运行时从面板拉**的，本机磁盘上没有副本；Nginx 的
+`location` 和 `proxy_pass` 却是静态的。面板一改，V2bX 跟着变，Nginx 不知道 ——
+表现就是「网站还开着，代理全连不上」。
+
+装完会自动启用两个触发点：
+
+| 触发 | 频率 | 作用 |
+|---|---|---|
+| `V2bX` 重启 | 每次重启 | drop-in 里的 `ExecStartPost`，立刻同步一次 |
+| `hkbt-sync.timer` | 每 3 分钟 | 兜底。面板上只改端口不会重启 V2bX，只能轮询发现 |
+
+同步只做一件事：比对面板最新值和 Nginx 配置里的指纹，不一致才重写 + 重载。
+
+```nginx
+# hkbt-fingerprint: jpcdn.cctv6.de|443|/sdf=?kfj|20000
+#                  域名          对外端口 路径     代理端口
+```
+
+手动触发：
+
+```bash
+python3 /opt/hkbt-deploy/app.py --sync
+systemctl list-timers hkbt-sync.timer
+journalctl -u hkbt-sync -n 30
+```
+
+**取不到值时一律不动。** 面板临时不可达、证书续期时文件闪一下、节点被临时改成 tcp ——
+这些都不会去改配置，只在日志里记一笔。因为 443 已经在服务了，为了一次抖动把站点拆掉不划算。
+
+同步间隔可以改：
+
+```bash
+python3 /opt/hkbt-deploy/app.py --install-sync --sync-interval 10   # 10 分钟
+HKBT_NO_SYNC=1 bash hkbt.sh                                        # 装的时候不挂同步
+```
+
 ### 面板能做什么
 
 `https://域名/__deploy-xxxxxxxx/`，随机路径，不额外开端口：
@@ -185,13 +247,19 @@ journalctl -u V2bX -n 50 --no-pager
 
 **在面板里改了节点路径或端口？**
 
-改完要重新生成一次 nginx 配置，否则分流规则还是旧的：
+不用管，会自动跟上。V2bX 重启后立刻同步一次，之后每 3 分钟检查一次，
+最长 3 分钟内 Nginx 就会换成新的端口和路径。
+
+想立刻生效：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/hkbt.sh | bash
+python3 /opt/hkbt-deploy/app.py --sync
 ```
 
-脚本会重新从面板读取端口和路径，不需要手工改任何文件。
+看到「配置一致，无需变更」说明本来就是对的；看到「已同步」说明刚才已经改过来了。
+
+如果输出「跳过：面板 API 不可达」，那是面板本身连不上，不是同步的问题 ——
+这时保持原配置不动是故意的，避免站点下线。
 
 **能连上但网页打不开？**
 
@@ -211,6 +279,11 @@ v2bx update
 ```
 
 更新只替换 V2bX 二进制，不会动 nginx 配置和站点文件。
+更新完 V2bX 会重启，同步任务自动触发一次 —— 如果新版改了什么默认值，
+Nginx 也会跟着对齐，不用手动处理。
+
+> 同步钩子写在 `V2bX.service.d/20-hkbt-sync.conf` 这个 drop-in 里，
+> 不在主单元文件内，所以 `v2bx update` 覆盖主单元时它不会丢。
 
 ---
 

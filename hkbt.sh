@@ -1,10 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  HKBT 自动伪装站点
-#  在 V2bX 安装完成后调用：等证书 → 装依赖 → 拉代码 → 随机部署
+#  流程：确认 V2bX 真的跑起来（服务/日志/端口）→ 装依赖 → 拉代码
+#        → 从面板读端口路径 → 随机部署 → 装上配置同步
 #
 #  单独运行： bash hkbt.sh
 #  跳过部署： HKBT_SKIP=1 bash install.sh
+#  跳过同步： HKBT_NO_SYNC=1 bash hkbt.sh
 #  指定密码： HKBT_PASSWORD='xxx' bash hkbt.sh
 # ============================================================
 
@@ -41,7 +43,160 @@ if [[ "$node_count" == "0" ]]; then
     exit 1
 fi
 
-# ---------- 2. 等证书 ----------
+# ---------- 2. 依赖 ----------
+if ! command -v nginx >/dev/null 2>&1; then
+    info "安装 Nginx"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq nginx >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y nginx >/dev/null 2>&1
+    fi
+    command -v nginx >/dev/null 2>&1 || { err "Nginx 安装失败，请手动安装后重试"; exit 1; }
+fi
+
+if ! python3 -c "import flask" >/dev/null 2>&1; then
+    info "安装 Flask"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y -qq python3-flask >/dev/null 2>&1
+    fi
+    python3 -c "import flask" >/dev/null 2>&1 || pip3 install flask >/dev/null 2>&1
+    python3 -c "import flask" >/dev/null 2>&1 || { err "Flask 安装失败"; exit 1; }
+fi
+
+# ---------- 3. 拉取 hkbt 代码（下面要用 app.py 探测面板）----------
+if [[ ! -f "$HKBT_DIR/app.py" ]]; then
+    info "下载 hkbt-deploy"
+    mkdir -p "$HKBT_DIR"
+    tmp=$(mktemp -d)
+    if ! curl -fsSL --max-time 60 \
+        "https://github.com/$HKBT_REPO/archive/refs/heads/master.tar.gz" \
+        -o "$tmp/hkbt.tar.gz"; then
+        err "下载失败，请检查网络或手动 git clone 到 $HKBT_DIR"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    tar xzf "$tmp/hkbt.tar.gz" -C "$tmp" 2>/dev/null
+    src=$(find "$tmp" -maxdepth 1 -type d -name "hkbt-deploy-*" | head -1)
+    [[ -n "$src" ]] || { err "压缩包结构异常"; rm -rf "$tmp"; exit 1; }
+    cp -r "$src"/. "$HKBT_DIR"/
+    rm -rf "$tmp"
+    ok "代码已就位"
+else
+    ok "已存在 $HKBT_DIR，跳过下载"
+fi
+
+# ---------- 4. 从面板读取节点参数 ----------
+# 端口和路径都由 V2bX 从面板拉取，这里问一次用于校验和显示，不写死任何值。
+# 面板不通就不部署 —— 猜错路径会让代理静默失联。
+info "从面板读取节点端口与路径（无需手工填写）"
+cd "$HKBT_DIR" || exit 1
+
+probe=$(python3 app.py --probe 2>/dev/null)
+prc=$?
+
+if [[ $prc -eq 2 ]]; then
+    err "面板没有返回节点路径（ws path），已中止部署"
+    echo "$probe" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print('  原因：%s' % (d.get('api_msg') or '节点不是 ws / grpc 类型，没有 path'))
+except Exception:
+    print('  原因：探测无输出')
+" 2>/dev/null
+    err "请检查 /etc/V2bX/config.json 的 ApiHost / ApiKey / NodeID，以及本机能否访问面板"
+    err "修好后重新执行：bash hkbt.sh"
+    exit 1
+fi
+
+proxy_port=$(echo "$probe" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('port') or '')
+except Exception:
+    print('')
+" 2>/dev/null)
+
+echo "$probe" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+src = '面板读取' if d.get('source') == 'panel' else '进程表/历史记录'
+print('  节点域名   %s' % (d.get('domain') or '未取到'))
+print('  代理端口   %s  ← %s' % (d.get('port') or '未取到', src))
+print('  代理路径   %s  ← %s' % (d.get('path') or '未取到', src))
+print('  节点类型   %s%s' % (d.get('network') or '未知', ' / TLS' if d.get('tls') else ''))
+" 2>/dev/null
+
+# ---------- 5. 等 V2bX 真正就绪 ----------
+# 只有代理确实跑起来（服务 active + 节点端口在监听）才继续。
+# 反过来的话，代理配置有错时网站会先占住 443，排查时两个问题搅在一起，
+# 分不清是代理挂了还是网站挂了。
+v2bx_fatal() {
+    printf '%s\n' "$1" | grep -qiE \
+        'panic|fatal|address already in use|json: cannot unmarshal|invalid (config|configuration)|failed to (start|create) (inbound|outbound)'
+}
+
+wait_v2bx_ready() {
+    local port="$1" timeout="${2:-150}" waited=0 log
+
+    if ! systemctl is-active --quiet V2bX 2>/dev/null; then
+        info "V2bX 未在运行，尝试启动"
+        systemctl start V2bX >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    info "等待 V2bX 就绪（服务状态 / 端口监听 / 启动日志）"
+    while (( waited < timeout )); do
+        if ! systemctl is-active --quiet V2bX 2>/dev/null; then
+            sleep 3; waited=$((waited + 3)); continue
+        fi
+
+        # 端口在监听 = 代理真的起来了，这是最硬的证据。
+        # 端口值来自面板，只会是节点端口，这里不按进程名过滤 ——
+        # 二进制改名、容器化部署都会让 comm 对不上，误判成「没起来」。
+        if [[ -n "$port" ]] && ss -tlnp 2>/dev/null \
+            | grep -qE "[:.]${port}([[:space:]]|$)"; then
+            ok "V2bX 已就绪（${port} 端口在监听）"
+            return 0
+        fi
+
+        # journalctl 在无日志时会输出「-- No entries --」「No journal files were found」
+        # 这类占位行，它们不是日志内容，必须过滤掉，否则会漏掉文件日志里的致命错误
+        log=$(journalctl -u V2bX -n 200 --no-pager 2>/dev/null | grep -v '^-- ')
+        # V2bX 也可以把日志写到文件（Log.Output），两条路都看
+        [[ -z "$log" ]] && log=$(cat /var/log/V2bX/*.log 2>/dev/null | tail -200)
+
+        if v2bx_fatal "$log"; then
+            err "V2bX 启动日志里有致命错误，先不部署网站"
+            echo "----------------------------------------------------------"
+            printf '%s\n' "$log" | grep -iE \
+                'panic|fatal|address already in use|json: cannot unmarshal|invalid (config|configuration)|failed to (start|create)' \
+                | tail -8 | sed 's/^/    /'
+            echo "----------------------------------------------------------"
+            err "修好代理再重跑本脚本：bash hkbt.sh"
+            err "完整日志：journalctl -u V2bX -n 100 --no-pager"
+            return 2
+        fi
+
+        sleep 3; waited=$((waited + 3))
+    done
+
+    err "${timeout} 秒内没等到 V2bX 就绪，先不部署网站"
+    err "查看状态：systemctl status V2bX --no-pager"
+    ss -tlnp 2>/dev/null | grep -iE 'V2bX|sing-box' | sed 's/^/    /' \
+        || echo "    没有观察到 V2bX 的监听端口"
+    err "网站配置依赖代理的端口和路径，代理没起来时部署等于盲配"
+    return 1
+}
+
+wait_v2bx_ready "$proxy_port" "${HKBT_WAIT:-150}"
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    exit 1
+fi
+
+# ---------- 6. 等证书 ----------
 cert_path=$(python3 - "$V2BX_CONF" <<'PY'
 import json, sys
 try:
@@ -70,50 +225,7 @@ if [[ ! -s "$cert_path" ]]; then
 fi
 ok "证书就绪"
 
-# ---------- 3. 依赖 ----------
-if ! command -v nginx >/dev/null 2>&1; then
-    info "安装 Nginx"
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1
-        apt-get install -y -qq nginx >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y nginx >/dev/null 2>&1
-    fi
-    command -v nginx >/dev/null 2>&1 || { err "Nginx 安装失败，请手动安装后重试"; exit 1; }
-fi
-
-if ! python3 -c "import flask" >/dev/null 2>&1; then
-    info "安装 Flask"
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -y -qq python3-flask >/dev/null 2>&1
-    fi
-    python3 -c "import flask" >/dev/null 2>&1 || pip3 install flask >/dev/null 2>&1
-    python3 -c "import flask" >/dev/null 2>&1 || { err "Flask 安装失败"; exit 1; }
-fi
-
-# ---------- 4. 拉取 hkbt 代码 ----------
-if [[ ! -f "$HKBT_DIR/app.py" ]]; then
-    info "下载 hkbt-deploy"
-    mkdir -p "$HKBT_DIR"
-    tmp=$(mktemp -d)
-    if ! curl -fsSL --max-time 60 \
-        "https://github.com/$HKBT_REPO/archive/refs/heads/master.tar.gz" \
-        -o "$tmp/hkbt.tar.gz"; then
-        err "下载失败，请检查网络或手动 git clone 到 $HKBT_DIR"
-        rm -rf "$tmp"
-        exit 1
-    fi
-    tar xzf "$tmp/hkbt.tar.gz" -C "$tmp" 2>/dev/null
-    src=$(find "$tmp" -maxdepth 1 -type d -name "hkbt-deploy-*" | head -1)
-    [[ -n "$src" ]] || { err "压缩包结构异常"; rm -rf "$tmp"; exit 1; }
-    cp -r "$src"/. "$HKBT_DIR"/
-    rm -rf "$tmp"
-    ok "代码已就位"
-else
-    ok "已存在 $HKBT_DIR，跳过下载"
-fi
-
-# ---------- 5. 生成密码 ----------
+# ---------- 7. 生成密码 ----------
 if [[ -n "$HKBT_PASSWORD" ]]; then
     PASS="$HKBT_PASSWORD"
 elif [[ -s "$PASS_FILE" ]]; then
@@ -123,41 +235,7 @@ else
     [[ ${#PASS} -lt 12 ]] && PASS="Hkbt@$(date +%s | tail -c 7)"
 fi
 
-# ---------- 6. 从面板读取节点参数 ----------
-# 端口和路径都由 V2bX 从面板拉取，这里只是提前问一次用于显示和校验，
-# 不写死任何值。面板不通就不部署 —— 猜错路径会让代理静默失联。
-info "从面板读取节点端口与路径（无需手工填写）"
-cd "$HKBT_DIR" || exit 1
-
-probe=$(python3 app.py --probe 2>/dev/null)
-prc=$?
-
-if [[ $prc -eq 2 ]]; then
-    err "面板没有返回节点路径（ws path），已中止部署"
-    echo "$probe" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    print('  原因：%s' % (d.get('api_msg') or '节点不是 ws / grpc 类型，没有 path'))
-except Exception:
-    print('  原因：探测无输出')
-" 2>/dev/null
-    err "请检查 /etc/V2bX/config.json 的 ApiHost / ApiKey / NodeID，以及本机能否访问面板"
-    err "修好后重新执行：bash hkbt.sh"
-    exit 1
-fi
-
-echo "$probe" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-src = '面板读取' if d.get('source') == 'panel' else '进程表/历史记录'
-print('  节点域名   %s' % (d.get('domain') or '未取到'))
-print('  代理端口   %s  ← %s' % (d.get('port') or '未取到', src))
-print('  代理路径   %s  ← %s' % (d.get('path') or '未取到', src))
-print('  节点类型   %s%s' % (d.get('network') or '未知', ' / TLS' if d.get('tls') else ''))
-" 2>/dev/null
-
-# ---------- 7. 部署 ----------
+# ---------- 8. 部署 ----------
 OUT_PORT="${HKBT_OUT_PORT:-443}"
 info "开始部署（对外端口 ${OUT_PORT}，随机模板 + 随机品牌）"
 DEPLOY_ARGS=(--init --auto --port "$OUT_PORT" --password "$PASS")
@@ -178,7 +256,17 @@ if [[ $rc -ne 0 ]]; then
     exit 1
 fi
 
-# ---------- 8. 证书续期方式检查 ----------
+# ---------- 9. 装上配置同步 ----------
+# 面板上改端口/路径后不会重启 V2bX，Nginx 的 location 也不会自己变，
+# 结果是网站还开着、代理已经连不上。这里挂一个 timer 定期比对，
+# 再给 V2bX 加个重启后立刻同步的钩子。
+if [[ "$HKBT_NO_SYNC" != "1" ]]; then
+    info "安装配置同步（V2bX 重启即触发 + 定时兜底）"
+    python3 app.py --install-sync --sync-interval "${HKBT_SYNC_INTERVAL:-3}" \
+        | sed 's/^/  /'
+fi
+
+# ---------- 10. 证书续期方式检查 ----------
 # CertMode=http 时 V2bX 要自己监听 80 做 HTTP-01，但 Nginx 已占 80，
 # 到期续签必然失败，网站和代理会一起失联。这里只提示，不擅自改配置。
 certmode=$(python3 - "$V2BX_CONF" <<'PY'
@@ -197,7 +285,7 @@ if [[ "$certmode" == "http" ]]; then
     err "      建议改成 dns 模式（如 Cloudflare），参考 TROUBLESHOOTING 第 11 条"
 fi
 
-# ---------- 9. 汇总 ----------
+# ---------- 11. 汇总 ----------
 python3 - "$PASS_FILE" <<'PY'
 import json, os, sys
 try:
@@ -231,3 +319,5 @@ print("=" * 58)
 PY
 
 ok "完成。浏览器打开 https://<你的域名>/ 应能看到企业站"
+echo -e "${yellow}提示${plain}：面板上改端口/路径后，最多 3 分钟自动同步到 Nginx；"
+echo -e "      想立刻生效可执行： python3 ${HKBT_DIR}/app.py --sync"
