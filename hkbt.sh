@@ -4,6 +4,16 @@
 #  流程：确认 V2bX 真的跑起来（服务/日志/端口）→ 装依赖 → 拉代码
 #        → 从面板读端口路径 → 随机部署 → 装上配置同步
 #
+#  Alpine 默认没有 bash，用 sh 启动时先补装再重新执行
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash >/dev/null 2>&1
+        command -v bash >/dev/null 2>&1 && exec bash "$0" "$@"
+    fi
+    echo "本脚本需要 bash，请先安装：apk add bash"
+    exit 1
+fi
+#
 #  单独运行： bash hkbt.sh
 #  跳过部署： HKBT_SKIP=1 bash install.sh
 #  跳过同步： HKBT_NO_SYNC=1 bash hkbt.sh
@@ -26,16 +36,54 @@ err()  { echo -e "${red}[HKBT]${plain} $*"; }
 
 [[ $EUID -ne 0 ]] && err "必须用 root 运行" && exit 1
 
-# 整套部署依赖 systemd：nginx 的启停、配置同步的 timer、V2bX 的重启钩子
-# 全都走 systemctl。Alpine(OpenRC)、容器镜像里没有 systemd，跑到一半才报
-# 「systemctl: not found」很难判断是哪一步出了问题，这里提前说清楚。
-if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
-    err "本机没有 systemd，无法自动部署伪装站点"
+# ---------- 服务管理器 ----------
+# Debian/Ubuntu 用 systemd，Alpine 用 OpenRC，命令完全不同，这里统一一层。
+INIT=""
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    INIT="systemd"
+elif command -v rc-service >/dev/null 2>&1 || [[ -x /sbin/openrc-run ]]; then
+    INIT="openrc"
+fi
+
+svc_do() {  # svc_do start|stop|restart|reload|enable|disable <服务名>
+    case "$INIT" in
+        systemd) systemctl "$1" "$2" ;;
+        openrc)
+            case "$1" in
+                start|stop|restart|reload|status) rc-service "$2" "$1" ;;
+                enable)  rc-update add "$2" default ;;
+                disable) rc-update del "$2" default 2>/dev/null ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_active() {
+    case "$INIT" in
+        systemd) systemctl is-active --quiet "$1" 2>/dev/null ;;
+        openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+svc_log() {  # svc_log <服务名> [行数]
+    local name="$1" n="${2:-200}"
+    case "$INIT" in
+        systemd) journalctl -u "$name" -n "$n" --no-pager 2>/dev/null | grep -v '^-- ' ;;
+        openrc)
+            { cat "/var/log/${name}.log" 2>/dev/null
+              logread 2>/dev/null | grep -i "$name"
+              grep -i "$name" /var/log/messages 2>/dev/null; } | tail -n "$n" ;;
+    esac
+}
+
+if [[ -z "$INIT" ]]; then
+    err "本机没有 systemd / OpenRC，无法管理服务"
     err "  当前 init: $(ps -p 1 -o comm= 2>/dev/null || echo 未知)"
-    err "  这套部署需要：nginx 启停、配置同步定时器、V2bX 重启钩子，全部基于 systemctl"
-    err "  Alpine / OpenRC / 容器环境请手动配置，或换 Debian 12 / Ubuntu 22+ 的系统"
+    err "  容器镜像里请手动配置，或换 Debian 12 / Ubuntu 22+ / Alpine 3.18+"
     exit 1
 fi
+info "服务管理器：${INIT}"
 
 [[ -f "$V2BX_CONF" ]] || { err "未找到 $V2BX_CONF，请先完成 V2bX 安装与配置"; exit 1; }
 
@@ -56,11 +104,30 @@ if [[ "$node_count" == "0" ]]; then
 fi
 
 # ---------- 2. 依赖 ----------
+# ss / curl / python3 是探测面板和端口用的，Alpine 最小系统里常常都没有
+missing=""
+for c in python3 curl ss; do
+    command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+done
+if [[ -n "$missing" ]]; then
+    info "安装基础依赖：$missing"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq python3 curl iproute2 >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache python3 curl iproute2 >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3 curl iproute >/dev/null 2>&1
+    fi
+fi
+
 if ! command -v nginx >/dev/null 2>&1; then
     info "安装 Nginx"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y -qq nginx >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache nginx >/dev/null 2>&1
     elif command -v yum >/dev/null 2>&1; then
         yum install -y nginx >/dev/null 2>&1
     fi
@@ -71,6 +138,8 @@ if ! python3 -c "import flask" >/dev/null 2>&1; then
     info "安装 Flask"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get install -y -qq python3-flask >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache py3-flask >/dev/null 2>&1
     fi
     python3 -c "import flask" >/dev/null 2>&1 || pip3 install flask >/dev/null 2>&1
     python3 -c "import flask" >/dev/null 2>&1 || { err "Flask 安装失败"; exit 1; }
@@ -152,15 +221,15 @@ v2bx_fatal() {
 wait_v2bx_ready() {
     local port="$1" timeout="${2:-150}" waited=0 log
 
-    if ! systemctl is-active --quiet V2bX 2>/dev/null; then
+    if ! svc_active V2bX; then
         info "V2bX 未在运行，尝试启动"
-        systemctl start V2bX >/dev/null 2>&1 || true
+        svc_do start V2bX >/dev/null 2>&1 || true
         sleep 2
     fi
 
     info "等待 V2bX 就绪（服务状态 / 端口监听 / 启动日志）"
     while (( waited < timeout )); do
-        if ! systemctl is-active --quiet V2bX 2>/dev/null; then
+        if ! svc_active V2bX; then
             sleep 3; waited=$((waited + 3)); continue
         fi
 
@@ -173,9 +242,7 @@ wait_v2bx_ready() {
             return 0
         fi
 
-        # journalctl 在无日志时会输出「-- No entries --」「No journal files were found」
-        # 这类占位行，它们不是日志内容，必须过滤掉，否则会漏掉文件日志里的致命错误
-        log=$(journalctl -u V2bX -n 200 --no-pager 2>/dev/null | grep -v '^-- ')
+        log=$(svc_log V2bX 200)
         # V2bX 也可以把日志写到文件（Log.Output），两条路都看
         [[ -z "$log" ]] && log=$(cat /var/log/V2bX/*.log 2>/dev/null | tail -200)
 
@@ -187,7 +254,7 @@ wait_v2bx_ready() {
                 | tail -8 | sed 's/^/    /'
             echo "----------------------------------------------------------"
             err "修好代理再重跑本脚本：bash hkbt.sh"
-            err "完整日志：journalctl -u V2bX -n 100 --no-pager"
+            err "完整日志：$([[ "$INIT" == systemd ]] && echo "journalctl -u V2bX -n 100 --no-pager" || echo "cat /var/log/V2bX.log")"
             return 2
         fi
 
@@ -195,7 +262,7 @@ wait_v2bx_ready() {
     done
 
     err "${timeout} 秒内没等到 V2bX 就绪，先不部署网站"
-    err "查看状态：systemctl status V2bX --no-pager"
+    err "查看状态：$([[ "$INIT" == systemd ]] && echo "systemctl status V2bX --no-pager" || echo "rc-service V2bX status")"
     ss -tlnp 2>/dev/null | grep -iE 'V2bX|sing-box' | sed 's/^/    /' \
         || echo "    没有观察到 V2bX 的监听端口"
     err "网站配置依赖代理的端口和路径，代理没起来时部署等于盲配"
@@ -231,7 +298,7 @@ for i in $(seq 1 60); do
     sleep 3
 done
 if [[ ! -s "$cert_path" ]]; then
-    err "180 秒内未等到证书，请检查：journalctl -u V2bX -n 50 --no-pager"
+    err "180 秒内未等到证书，请检查 V2bX 日志（journalctl -u V2bX / cat /var/log/V2bX.log）"
     err "常见原因：域名未解析到本机 / 面板节点未配置 / CertMode 为 none"
     exit 1
 fi

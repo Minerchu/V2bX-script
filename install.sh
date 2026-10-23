@@ -1,4 +1,15 @@
 #!/bin/bash
+# Alpine 默认不带 bash，而本脚本用了 [[ ]]、数组等 bash 语法。
+# 用 sh install.sh 启动时先自动补装 bash 再重新执行，否则会一路报错。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v apk >/dev/null 2>&1; then
+        echo "检测到 Alpine，正在安装 bash..."
+        apk add --no-cache bash >/dev/null 2>&1
+        command -v bash >/dev/null 2>&1 && exec bash "$0" "$@"
+    fi
+    echo "本脚本需要 bash，请先安装：apk add bash  或  apt install bash"
+    exit 1
+fi
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -154,6 +165,22 @@ check_status() {
     fi
 }
 
+# BusyBox 的 wget 没有 -N / --progress=bar / --no-check-certificate，
+# Alpine 上直接用会报 unrecognized option。统一走 curl，缺 curl 时退回 wget -O。
+download() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 2 --max-time 300 "$url" -o "$out" && return 0
+        curl -fsSLk --retry 2 --max-time 300 "$url" -o "$out" && return 0
+        return 1
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -O "$out" "$url" && return 0
+        return 1
+    fi
+    return 1
+}
+
 install_V2bX() {
     if [[ -e /usr/local/V2bX/ ]]; then
         rm -rf /usr/local/V2bX/
@@ -169,7 +196,7 @@ install_V2bX() {
             exit 1
         fi
         echo -e "检测到 V2bX 最新版本：${last_version}，开始安装"
-        wget --no-check-certificate -N --progress=bar -O /usr/local/V2bX/V2bX-linux.zip https://github.com/wyx2685/V2bX/releases/download/${last_version}/V2bX-linux-${arch}.zip
+        download "https://github.com/wyx2685/V2bX/releases/download/${last_version}/V2bX-linux-${arch}.zip" /usr/local/V2bX/V2bX-linux.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 V2bX 失败，请确保你的服务器能够下载 Github 的文件${plain}"
             exit 1
@@ -178,7 +205,7 @@ install_V2bX() {
         last_version=$1
         url="https://github.com/wyx2685/V2bX/releases/download/${last_version}/V2bX-linux-${arch}.zip"
         echo -e "开始安装 V2bX $1"
-        wget --no-check-certificate -N --progress=bar -O /usr/local/V2bX/V2bX-linux.zip ${url}
+        download "${url}" /usr/local/V2bX/V2bX-linux.zip
         if [[ $? -ne 0 ]]; then
             echo -e "${red}下载 V2bX $1 失败，请确保此版本存在${plain}"
             exit 1
@@ -205,9 +232,12 @@ command_user="root"
 
 pidfile="/run/V2bX.pid"
 command_background="yes"
+output_log="/var/log/V2bX.log"
+error_log="/var/log/V2bX.err"
 
 depend() {
         need net
+        after firewall
 }
 EOF
         chmod +x /etc/init.d/V2bX
