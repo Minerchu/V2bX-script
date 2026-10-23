@@ -21,6 +21,29 @@ https://你的域名/<路径>    →  代理握手（101）
 wget -N https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh && bash install.sh
 ```
 
+> BusyBox 的 wget 没有 `-N`，Alpine 上改用：
+> `curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh -o install.sh && sh install.sh`
+
+### 支持的系统
+
+| 系统 | init | 说明 |
+|---|---|---|
+| Debian 11+ / Ubuntu 20+ | systemd | 默认支持 |
+| Alpine 3.18+ | OpenRC | 自动装 bash、用 `rc-service` 管理服务、`cron` 做定时同步 |
+| RHEL / Rocky / Alma | systemd | 默认支持 |
+
+两种 init 系统的差异脚本自己处理，不用改命令：
+
+| | systemd | OpenRC |
+|---|---|---|
+| 启停服务 | `systemctl` | `rc-service` |
+| 开机自启 | `systemctl enable` | `rc-update add` |
+| 看日志 | `journalctl -u V2bX` | `tail /var/log/V2bX.log` |
+| 定时同步 | `hkbt-sync.timer` | `cron` |
+| 重启钩子 | systemd drop-in | init 脚本的 `post_start()` |
+
+用 `sh install.sh` 启动也行 —— Alpine 上没有 bash 时会先 `apk add bash` 再重新执行自己。
+
 安装流程和原版完全一样（选核心、填面板地址、API Key、节点 ID、证书模式），
 **最后会多两步**：
 
@@ -233,9 +256,15 @@ HKBT_NO_SYNC=1 bash hkbt.sh                                        # 装的时�
 **装完网站打不开？**
 
 ```bash
+# systemd
 systemctl status nginx
-curl -sk -o /dev/null -w "%{http_code}\n" https://你的域名/
 journalctl -u V2bX -n 50 --no-pager
+
+# OpenRC（Alpine）
+rc-service nginx status
+tail -50 /var/log/V2bX.log
+
+curl -sk -o /dev/null -w "%{http_code}\n" https://你的域名/
 ```
 
 最常见的原因是证书还没签下来（域名没解析到本机、面板节点没配好）。
