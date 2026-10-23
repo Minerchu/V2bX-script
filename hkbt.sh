@@ -150,10 +150,17 @@ if [[ ! -f "$HKBT_DIR/app.py" ]]; then
     info "下载 hkbt-deploy"
     mkdir -p "$HKBT_DIR"
     tmp=$(mktemp -d)
-    if ! curl -fsSL --max-time 60 \
-        "https://github.com/$HKBT_REPO/archive/refs/heads/master.tar.gz" \
-        -o "$tmp/hkbt.tar.gz"; then
-        err "下载失败，请检查网络或手动 git clone 到 $HKBT_DIR"
+    tarball="https://github.com/$HKBT_REPO/archive/refs/heads/master.tar.gz"
+    got=0
+    for u in "$tarball" "https://ghproxy.net/$tarball" "https://gh-proxy.com/$tarball"; do
+        if curl -fsSL --connect-timeout 15 --max-time 90 "$u" -o "$tmp/hkbt.tar.gz" 2>/dev/null; then
+            got=1; break
+        fi
+        info "下载失败，换下一个源…"
+    done
+    if [[ $got -ne 1 ]]; then
+        err "下载失败：GitHub 直连和镜像都不通，请检查 DNS 与外网连通性"
+        err "  手工验证：nslookup github.com；curl -I https://ghproxy.net"
         rm -rf "$tmp"
         exit 1
     fi

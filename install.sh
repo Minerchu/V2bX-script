@@ -168,16 +168,17 @@ check_status() {
 # BusyBox 的 wget 没有 -N / --progress=bar / --no-check-certificate，
 # Alpine 上直接用会报 unrecognized option。统一走 curl，缺 curl 时退回 wget -O。
 download() {
-    local url="$1" out="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 2 --max-time 300 "$url" -o "$out" && return 0
-        curl -fsSLk --retry 2 --max-time 300 "$url" -o "$out" && return 0
-        return 1
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$out" "$url" && return 0
-        return 1
-    fi
+    local url="$1" out="$2" u
+    # 直连优先，失败后依次走公共加速。DNS 不通或 GitHub 被拦时靠这几个兜底。
+    for u in "$url" "https://ghproxy.net/$url" "https://gh-proxy.com/$url"; do
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 1 --connect-timeout 15 --max-time 300 "$u" -o "$out" 2>/dev/null && return 0
+            curl -fsSLk --retry 1 --connect-timeout 15 --max-time 300 "$u" -o "$out" 2>/dev/null && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -T 20 -O "$out" "$u" 2>/dev/null && return 0
+        fi
+        echo "  下载失败，换下一个源…"
+    done
     return 1
 }
 
