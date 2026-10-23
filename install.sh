@@ -1,6 +1,74 @@
 #!/bin/bash
+# ------------------------------------------------------------
+# 0. DNS 自检与自动修复（纯 POSIX sh，必须放在 bash 自举之前）
+#
+# apk add bash 本身要解析软件源域名。DNS 挂了的话，连 bash 都装不上，
+# 脚本会在第 5 行就报 "Could not resolve host"，用户完全看不出原因。
+# 所以这里先用 busybox 自带的 nslookup 探一遍，能修就修掉。
+# ------------------------------------------------------------
+_hkbt_dns_query() {
+    # $1=域名  $2=指定 DNS 服务器（省略则走系统 resolv.conf）；解析成功返回 0
+    if command -v nslookup >/dev/null 2>&1; then
+        if [ -n "${2:-}" ]; then
+            _out=$(timeout 6 nslookup "$1" "$2" 2>&1)
+        else
+            _out=$(timeout 6 nslookup "$1" 2>&1)
+        fi
+        # 失败时 busybox 仍会打印 "Server:/Address:" 两行，不能用 Address 判断，
+        # 只认 "Name:"，并排掉明确的失败字样
+        case "$_out" in
+            *"can't find"*|*"can't resolve"*|*"SERVFAIL"*|*"timed out"*|*"no servers"*) return 1 ;;
+        esac
+        printf '%s' "$_out" | grep -q "Name:" || return 1
+        return 0
+    fi
+    # 没有 nslookup 时退回 ping（会走系统解析）
+    ping -c1 -W3 "$1" >/dev/null 2>&1
+}
+
+_hkbt_fix_dns() {
+    _hkbt_dns_query github.com && return 0
+    echo "  DNS 解析失败，尝试自动修复…"
+
+    # resolv.conf 可能是软链（→ /run/resolvconf、systemd-resolved 等），写真实路径
+    _rc=$(readlink -f /etc/resolv.conf 2>/dev/null)
+    [ -n "$_rc" ] || _rc=/etc/resolv.conf
+    [ -s /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.hkbt.bak 2>/dev/null
+
+    for _ns in 223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8 9.9.9.9; do
+        # 先直连问这个服务器，通了才值得写进配置
+        _hkbt_dns_query github.com "$_ns" || continue
+
+        _alt=1.1.1.1
+        [ "$_ns" = "1.1.1.1" ] && _alt=8.8.8.8
+        # 有些镜像把 resolv.conf 锁了，写之前先解锁
+        command -v chattr >/dev/null 2>&1 && chattr -i "$_rc" 2>/dev/null
+        printf 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:2\n' \
+            "$_ns" "$_alt" > "$_rc" 2>/dev/null || continue
+
+        if _hkbt_dns_query github.com; then
+            # 锁住，防止 udhcpc / dhcpcd 下次续租把文件冲回空值
+            command -v chattr >/dev/null 2>&1 && chattr +i "$_rc" 2>/dev/null
+            echo "  DNS 已修复：nameserver $_ns（已锁定防 DHCP 覆盖，解锁：chattr -i /etc/resolv.conf）"
+            [ -f /etc/resolv.conf.hkbt.bak ] && echo "  原文件备份：/etc/resolv.conf.hkbt.bak"
+            return 0
+        fi
+    done
+
+    echo "  自动修复失败：没有一个公共 DNS 能解析 github.com"
+    echo "  这通常说明本机没有外网出口，而不是 DNS 配错了。先确认："
+    echo "    ip route | head -3          # 有没有默认路由"
+    echo "    ping -c2 1.1.1.1            # 裸 IP 能不能通"
+    echo "  裸 IP 通、域名不通 → 手工指定：echo 'nameserver 223.5.5.5' > /etc/resolv.conf"
+    return 1
+}
+
+_hkbt_fix_dns || echo "  （继续尝试安装，若卡在下载请先修好 DNS）"
+
+# ------------------------------------------------------------
 # Alpine 默认不带 bash，而本脚本用了 [[ ]]、数组等 bash 语法。
 # 用 sh install.sh 启动时先自动补装 bash 再重新执行，否则会一路报错。
+# ------------------------------------------------------------
 if [ -z "${BASH_VERSION:-}" ]; then
     if command -v apk >/dev/null 2>&1; then
         echo "检测到 Alpine，正在安装 bash..."

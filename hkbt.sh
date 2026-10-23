@@ -4,7 +4,42 @@
 #  流程：确认 V2bX 真的跑起来（服务/日志/端口）→ 装依赖 → 拉代码
 #        → 从面板读端口路径 → 随机部署 → 装上配置同步
 #
-#  Alpine 默认没有 bash，用 sh 启动时先补装再重新执行
+#  单独运行： bash hkbt.sh
+#  跳过部署： HKBT_SKIP=1 bash install.sh
+#  跳过同步： HKBT_NO_SYNC=1 bash hkbt.sh
+#  指定密码： HKBT_PASSWORD='xxx' bash hkbt.sh
+# ============================================================
+
+# ---------- DNS 自检（必须在 bash 自举之前，可能由 busybox ash 执行）----------
+_hkbt_dns_ok() {
+    if command -v nslookup >/dev/null 2>&1; then
+        _o=$(timeout 6 nslookup github.com ${1:+"$1"} 2>&1)
+        case "$_o" in
+            *"can't find"*|*"can't resolve"*|*"SERVFAIL"*|*"timed out"*) return 1 ;;
+        esac
+        printf '%s' "$_o" | grep -q "Name:" && return 0
+        return 1
+    fi
+    ping -c1 -W3 github.com >/dev/null 2>&1
+}
+
+if ! _hkbt_dns_ok; then
+    echo "  DNS 解析失败，尝试自动修复…"
+    _rc=$(readlink -f /etc/resolv.conf 2>/dev/null); [ -n "$_rc" ] || _rc=/etc/resolv.conf
+    for _ns in 223.5.5.5 119.29.29.29 1.1.1.1 8.8.8.8; do
+        _hkbt_dns_ok "$_ns" || continue
+        command -v chattr >/dev/null 2>&1 && chattr -i "$_rc" 2>/dev/null
+        printf 'nameserver %s\nnameserver 1.1.1.1\noptions timeout:2 attempts:2\n' "$_ns" > "$_rc" 2>/dev/null || continue
+        if _hkbt_dns_ok; then
+            command -v chattr >/dev/null 2>&1 && chattr +i "$_rc" 2>/dev/null
+            echo "  DNS 已修复：nameserver $_ns（解锁：chattr -i /etc/resolv.conf）"
+            break
+        fi
+    done
+    _hkbt_dns_ok || echo "  DNS 仍不可用，下载可能失败"
+fi
+
+# Alpine 默认没有 bash，用 sh 启动时先补装再重新执行
 if [ -z "${BASH_VERSION:-}" ]; then
     if command -v apk >/dev/null 2>&1; then
         apk add --no-cache bash >/dev/null 2>&1
@@ -13,12 +48,6 @@ if [ -z "${BASH_VERSION:-}" ]; then
     echo "本脚本需要 bash，请先安装：apk add bash"
     exit 1
 fi
-#
-#  单独运行： bash hkbt.sh
-#  跳过部署： HKBT_SKIP=1 bash install.sh
-#  跳过同步： HKBT_NO_SYNC=1 bash hkbt.sh
-#  指定密码： HKBT_PASSWORD='xxx' bash hkbt.sh
-# ============================================================
 
 red='\033[0;31m'
 green='\033[0;32m'

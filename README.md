@@ -18,11 +18,32 @@ https://你的域名/<路径>    →  代理握手（101）
 ## 一键安装
 
 ```bash
-wget -N https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh -o install.sh && sh install.sh
 ```
 
-> BusyBox 的 wget 没有 `-N`，Alpine 上改用：
-> `curl -fsSL https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh -o install.sh && sh install.sh`
+用 `sh` 就行，不需要先装 bash。
+
+拉不到脚本时（DNS 挂了 / GitHub 被拦），换镜像：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Minerchu/V2bX-script@master/install.sh -o install.sh && sh install.sh
+```
+
+```bash
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/Minerchu/V2bX-script/master/install.sh -o install.sh && sh install.sh
+```
+
+### 脚本自己会先检查网络
+
+在动任何东西之前，`install.sh` 会先探一遍 `github.com` 能不能解析。解析不了就依次试 `223.5.5.5` / `119.29.29.29` / `1.1.1.1` / `8.8.8.8` / `9.9.9.9`，哪个通就写进 `/etc/resolv.conf` 并 `chattr +i` 锁住（防 DHCP 续租覆盖）。
+
+这一步必须排在 `apk add bash` 之前 —— 装 bash 本身也要解析软件源域名，DNS 不通的话连 bash 都装不上，脚本会在第 5 行报 `Could not resolve host`，看不出真正原因。
+
+所有 DNS 都不通时会明确告诉你「这不是 DNS 配错，是本机没有外网出口」，并给出 `ip route` / `ping 1.1.1.1` 两条自查命令。
+
+> 想改回原来的 DNS：`chattr -i /etc/resolv.conf`，原文件在 `/etc/resolv.conf.hkbt.bak`。
+
+下载环节同样有兜底：V2bX 二进制和 hkbt-deploy 源码都先试 GitHub 直连，失败自动切 `ghproxy.net` / `gh-proxy.com`。
 
 ### 支持的系统
 
