@@ -371,13 +371,22 @@ if [[ $rc -ne 0 ]]; then
     exit 1
 fi
 
-# ---------- 9. 启动部署面板 ----------
+# ---------- 9. 开机自启 ----------
+# Alpine 的 nginx 包装完不会自动 enable，重启后网站直接 404。
+# V2bX 和 hkbt-deploy 由各自的安装流程处理，nginx 这里补上。
+if command -v rc-update >/dev/null 2>&1; then
+    rc-update add nginx default >/dev/null 2>&1 || true
+elif command -v systemctl >/dev/null 2>&1; then
+    systemctl enable nginx >/dev/null 2>&1 || true
+fi
+
+# ---------- 10. 启动部署面板 ----------
 # Nginx 里有一段 /__deploy-xxx/ 反代到 127.0.0.1:8899，面板进程没起来就是 502。
 # 站点本身是好的，但用户点面板打不开，很容易误判成部署失败。
 info "启动部署面板"
 python3 app.py --install-panel 2>&1 | sed 's/^/  /'
 
-# ---------- 10. 装上配置同步 ----------
+# ---------- 11. 装上配置同步 ----------
 # 面板上改端口/路径后不会重启 V2bX，Nginx 的 location 也不会自己变，
 # 结果是网站还开着、代理已经连不上。这里挂一个 timer 定期比对，
 # 再给 V2bX 加个重启后立刻同步的钩子。
@@ -387,7 +396,7 @@ if [[ "$HKBT_NO_SYNC" != "1" ]]; then
         | sed 's/^/  /'
 fi
 
-# ---------- 11. 证书续期方式检查 ----------
+# ---------- 12. 证书续期方式检查 ----------
 # CertMode=http 时 V2bX 要自己监听 80 做 HTTP-01，但 Nginx 已占 80，
 # 到期续签必然失败，网站和代理会一起失联。这里只提示，不擅自改配置。
 certmode=$(python3 - "$V2BX_CONF" <<'PY'
@@ -406,7 +415,7 @@ if [[ "$certmode" == "http" ]]; then
     err "      建议改成 dns 模式（如 Cloudflare），参考 TROUBLESHOOTING 第 11 条"
 fi
 
-# ---------- 12. 汇总 ----------
+# ---------- 13. 汇总 ----------
 python3 - "$PASS_FILE" <<'PY'
 import json, os, sys
 try:
