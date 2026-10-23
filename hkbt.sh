@@ -25,6 +25,18 @@ ok()   { echo -e "${green}[HKBT]${plain} $*"; }
 err()  { echo -e "${red}[HKBT]${plain} $*"; }
 
 [[ $EUID -ne 0 ]] && err "必须用 root 运行" && exit 1
+
+# 整套部署依赖 systemd：nginx 的启停、配置同步的 timer、V2bX 的重启钩子
+# 全都走 systemctl。Alpine(OpenRC)、容器镜像里没有 systemd，跑到一半才报
+# 「systemctl: not found」很难判断是哪一步出了问题，这里提前说清楚。
+if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+    err "本机没有 systemd，无法自动部署伪装站点"
+    err "  当前 init: $(ps -p 1 -o comm= 2>/dev/null || echo 未知)"
+    err "  这套部署需要：nginx 启停、配置同步定时器、V2bX 重启钩子，全部基于 systemctl"
+    err "  Alpine / OpenRC / 容器环境请手动配置，或换 Debian 12 / Ubuntu 22+ 的系统"
+    exit 1
+fi
+
 [[ -f "$V2BX_CONF" ]] || { err "未找到 $V2BX_CONF，请先完成 V2bX 安装与配置"; exit 1; }
 
 # ---------- 1. 确认节点配置存在 ----------
