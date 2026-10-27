@@ -84,6 +84,15 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
+# 部署选项：转成环境变量，后面调起的 hkbt.sh 直接继承，
+# 不用改调用链，也不怕中间套了几层。
+for _arg in "$@"; do
+    case "$_arg" in
+        --block-cn)   export HKBT_BLOCK_CN=1 ;;
+        --unblock-cn) export HKBT_BLOCK_CN=0; export HKBT_UNBLOCK_CN=1 ;;
+    esac
+done
+
 cur_dir=$(pwd)
 
 # check root
