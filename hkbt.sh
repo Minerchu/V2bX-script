@@ -63,6 +63,21 @@ info() { echo -e "${yellow}[HKBT]${plain} $*"; }
 ok()   { echo -e "${green}[HKBT]${plain} $*"; }
 err()  { echo -e "${red}[HKBT]${plain} $*"; }
 
+# ---------- 命令行参数 ----------
+# 环境变量和参数两种写法都收：批量装机时用 env，手工跑时用参数。
+for _arg in "$@"; do
+    case "$_arg" in
+        --block-cn)   HKBT_BLOCK_CN=1 ;;
+        --unblock-cn) HKBT_BLOCK_CN=0; HKBT_UNBLOCK_CN=1 ;;
+        --help|-h)
+            echo "用法：bash hkbt.sh [--block-cn|--unblock-cn]"
+            echo "  --block-cn    屏蔽中国大陆 IP 与主流大陆域名（服务端强制）"
+            echo "  --unblock-cn  解除上面的规则"
+            echo "环境变量：HKBT_SKIP / HKBT_NO_SYNC / HKBT_PASSWORD / HKBT_OUT_PORT"
+            exit 0 ;;
+    esac
+done
+
 [[ $EUID -ne 0 ]] && err "必须用 root 运行" && exit 1
 
 # ---------- 服务管理器 ----------
@@ -394,6 +409,18 @@ if [[ "$HKBT_NO_SYNC" != "1" ]]; then
     info "安装配置同步（V2bX 重启即触发 + 定时兜底）"
     python3 app.py --install-sync --sync-interval "${HKBT_SYNC_INTERVAL:-3}" \
         | sed 's/^/  /'
+fi
+
+# ---------- 11.5 大陆访问拦截 ----------
+# 有人不懂分流，开着「全局」刷国内 App：流量绕一圈出去，既费带宽，对端也看到海外 IP。
+# 客户端规则拦不住（全局模式会绕过所有 rules），只能服务端直接 block。
+if [[ "$HKBT_UNBLOCK_CN" == "1" ]]; then
+    info "解除大陆访问拦截"
+    python3 app.py --unblock-cn 2>&1 | sed 's/^/  /' || err "解除失败"
+elif [[ "$HKBT_BLOCK_CN" == "1" ]]; then
+    info "启用大陆访问拦截（服务端 block）"
+    python3 app.py --block-cn 2>&1 | sed 's/^/  /' \
+        || err "大陆拦截未启用，可稍后手动执行：python3 app.py --block-cn"
 fi
 
 # ---------- 12. 证书续期方式检查 ----------
